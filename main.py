@@ -1,14 +1,15 @@
 """
-Projet Technique - Extraction automatique de courbes à partir de graphiques scannés
-Auteurs : Projet 2A EMSE
+Technical Project - Automated Curve Extraction from Scanned Scientific Plots
+Authors: 2A EMSE Project
 
-Pipeline de traitement :
-1. Détection OCR et calibration robuste des axes (RANSAC linéaire).
-2. Extraction de la légende par analyse morphologique et colorimétrique.
-3. Segmentation des courbes :
-   - Détection des tracés colorés par clustering non supervisé (MeanShift sur HSV cyclique).
-   - Extraction de la courbe noire par soustraction morphologique (axes/grilles/textes).
-4. Échantillonnage de la fonction f(x) = y et export des données sous Excel.
+Processing Pipeline:
+1. OCR detection and robust axis calibration (linear RANSAC).
+2. Legend extraction via morphological and colorimetric analysis.
+3. Curve segmentation:
+   - Colored traces via unsupervised clustering (MeanShift on cyclic HSV).
+   - Black/dark traces via subtractive morphology (filtering axes/grids/text).
+4. Decoupling continuous model lines and discrete experimental markers.
+5. Sampling f(x) = y and exporting calibrated data to Excel & verification charts.
 """
 
 import argparse
@@ -21,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib
-matplotlib.use("Agg")  # Mode headless pour le rendu hors interface
+matplotlib.use("Agg")  # Headless mode for rendering without a display
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -32,63 +33,64 @@ from sklearn.cluster import KMeans, MeanShift
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ------------------------------------------------------------------------------
-# Paramètres globaux et seuils expérimentaux
+# Global Parameters and Experimental Thresholds
 # ------------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_INPUT_DIR = os.path.join(BASE_DIR, "images")
 DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "data")
 
-# Paramètres de dimensionnement OCR
-# Un facteur 1.5x et un plafond à 1024px offrent le meilleur compromis
-# entre lisibilité des petits caractères et rapidité de calcul sur CPU.
+# OCR scaling parameters
+# A 1.5x scale factor capped at 1024px offers the optimal trade-off
+# between small character legibility and CPU inference speed.
 OCR_SCALE_FACTOR = 1.5
 OCR_MAX_DIMENSION = 1024
 
-# Seuils de détection de composantes (en pixels)
-MIN_COLORED_PIXELS = 500   # Élimine le bruit chromatique et artefacts JPEG
-MIN_CLUSTER_PIXELS = 100   # Taille minimale pour valider une courbe colorée
-MIN_BLACK_PIXELS = 200     # Seuil de validation pour un tracé noir/sombre
-LEGEND_MAX_COLOR_DIST = 70 # Distance euclidienne RGB maximale pastille <-> courbe
+# Component detection thresholds (in pixels)
+MIN_COLORED_PIXELS = 500   # Eliminates chromatic noise and JPEG compression artifacts
+MIN_CLUSTER_PIXELS = 100   # Minimum cluster size to validate a colored curve
+MIN_BLACK_PIXELS = 200     # Validation threshold for a dark/black trace
+LEGEND_MAX_COLOR_DIST = 70 # Maximum Euclidean RGB distance patch <-> curve
 
-# Regex robuste pour les graduations : accepte entiers, décimaux, négatifs,
-# et nombres sans zéro initial (ex: .1, -.5, 0.42, 10)
+# Robust regex for numeric tick marks: accepts integers, decimals, negatives,
+# and numbers without leading zeros (e.g. .1, -.5, 0.42, 10)
 NUMBER_REGEX = re.compile(r"^-?(?:\d+(?:\.\d*)?|\.\d+)$")
 
 _ocr_instance = None
 _KNOWN_COLORS = {
-    "Noire": (0, 0, 0),
-    "Grise": (128, 128, 128),
-    "Blanche": (255, 255, 255),
-    "Rouge": (255, 0, 0),
-    "Verte": (0, 255, 0),
-    "Bleue": (0, 0, 255),
-    "Jaune": (255, 255, 0),
+    "Black": (0, 0, 0),
+    "Gray": (128, 128, 128),
+    "White": (255, 255, 255),
+    "Red": (255, 0, 0),
+    "Green": (0, 255, 0),
+    "Blue": (0, 0, 255),
+    "Yellow": (255, 255, 0),
     "Cyan": (0, 255, 255),
     "Magenta": (255, 0, 255),
     "Orange": (255, 128, 0),
-    "Rose": (255, 192, 203),
-    "Marron": (139, 69, 19)
+    "Pink": (255, 192, 203),
+    "Brown": (139, 69, 19)
 }
+
 
 def get_closest_color_name(rgb: np.ndarray) -> str:
     """
-    Détermine le nom usuel d'une couleur en espace HSV/colorimétrique.
-    Garantit la distinction fidèle entre Rouge, Orange, Jaune, Bleu, etc.
+    Determines the common name of a color in HSV/colorimetric space.
+    Ensures reliable discrimination between Red, Orange, Yellow, Blue, etc.
     """
     r, g, b = float(rgb[0]), float(rgb[1]), float(rgb[2])
     max_c = max(r, g, b)
     min_c = min(r, g, b)
     delta = max_c - min_c
 
-    # Niveaux de gris / achromatique
+    # Grayscale / achromatic
     if max_c < 45:
-        return "Noire"
+        return "Black"
     if max_c > 225 and delta < 20:
-        return "Blanche"
+        return "White"
     if delta < 25:
-        return "Grise"
+        return "Gray"
 
-    # Calcul de la teinte (Hue en degrés [0, 360[)
+    # Compute Hue in degrees [0, 360[
     if delta == 0:
         hue = 0.0
     elif max_c == r:
@@ -98,43 +100,44 @@ def get_closest_color_name(rgb: np.ndarray) -> str:
     else:
         hue = 60.0 * (((r - g) / delta) + 4)
 
-    # Classification sectorielle
+    # Sectoral classification
     if hue >= 345 or hue < 15:
-        return "Rouge"
+        return "Red"
     elif 15 <= hue < 45:
         return "Orange"
     elif 45 <= hue < 75:
-        return "Jaune"
+        return "Yellow"
     elif 75 <= hue < 165:
-        return "Verte"
+        return "Green"
     elif 165 <= hue < 195:
         return "Cyan"
     elif 195 <= hue < 265:
-        return "Bleue"
+        return "Blue"
     elif 265 <= hue < 315:
         return "Magenta"
     elif 315 <= hue < 345:
-        return "Rose"
+        return "Pink"
 
-    return "Inconnue"
+    return "Unknown"
+
 
 def get_ocr_engine():
-    """Initialise le lecteur EasyOCR une seule fois (mise en cache)."""
+    """Initializes EasyOCR reader once (cached instance)."""
     global _ocr_instance
     if _ocr_instance is None:
         import easyocr
-        print("Chargement du modèle EasyOCR...")
+        print("Loading EasyOCR model...")
         _ocr_instance = easyocr.Reader(["en"], gpu=False, verbose=False)
     return _ocr_instance
 
 
 def parse_tick_value(text: str) -> Optional[float]:
     """
-    Nettoie et convertit une chaîne OCR en valeur numérique.
-    Gère les virgules, tirets unicode et les artefacts de graduation collés au texte.
+    Cleans and parses an OCR string into a numeric float value.
+    Handles commas, unicode minus signs, and attached tick marks.
     """
     cleaned = text.replace(",", ".").replace("\u2212", "-").replace(" ", "")
-    cleaned = cleaned.rstrip("-\u2013\u2014_|")  # Retire les ticks de graduations accolés
+    cleaned = cleaned.rstrip("-\u2013\u2014_|")  # Remove trailing tick mark artifacts
     
     if NUMBER_REGEX.match(cleaned):
         try:
@@ -146,12 +149,12 @@ def parse_tick_value(text: str) -> Optional[float]:
 
 def extract_text_boxes(image: np.ndarray, binarize: bool = False) -> List[dict]:
     """
-    Exécute la reconnaissance optique sur l'image redimensionnée.
-    Renvoie les boîtes et valeurs repositionnées dans le repère de l'image d'origine.
+    Runs optical character recognition on the scaled image.
+    Returns bounding boxes and parsed values mapped back to original image space.
     """
     height, width = image.shape[:2]
     max_dim = max(height, width)
-    # Assure une taille optimale pour l'OCR des chiffres (cible ~950px pour petites images)
+    # Ensure optimal sizing for numeric OCR (~950px target for small images)
     if max_dim < 850:
         scale = max(1.8, min(3.2, 950.0 / max_dim))
     else:
@@ -184,7 +187,7 @@ def extract_text_boxes(image: np.ndarray, binarize: bool = False) -> List[dict]:
 
 def group_ticks_by_axis(numbers: List[dict], coord_key: str, tolerance: float) -> List[List[dict]]:
     """
-    Regroupe les graduations alignées le long d'un axe (abscisse constante ou ordonnée constante).
+    Groups tick marks aligned along an axis (constant X or constant Y coordinate).
     """
     groups: List[List[dict]] = []
     for item in sorted(numbers, key=lambda n: n[coord_key]):
@@ -200,7 +203,7 @@ def group_ticks_by_axis(numbers: List[dict], coord_key: str, tolerance: float) -
 
 
 def verify_regular_spacing(positions: np.ndarray, values: np.ndarray, tolerance: float = 0.06) -> bool:
-    """Vérifie que 3 points forment des graduations régulièrement espacées."""
+    """Verifies that 3 points form regularly spaced tick marks."""
     order = np.argsort(positions)
     d_pos = np.diff(positions[order])
     d_val = np.diff(values[order])
@@ -210,8 +213,8 @@ def verify_regular_spacing(positions: np.ndarray, values: np.ndarray, tolerance:
 
 def fit_axis_ransac(points: List[dict], coord_key: str) -> Tuple[Optional[Tuple[float, float, float, float]], int]:
     """
-    Ajustement linéaire robuste par consensus (RANSAC).
-    Élimine les graduations aberrantes lues par l'OCR.
+    Robust linear fitting by consensus (RANSAC).
+    Eliminates outlier tick marks read by OCR.
     """
     if len(points) < 2:
         return None, 0
@@ -227,7 +230,7 @@ def fit_axis_ransac(points: List[dict], coord_key: str) -> Tuple[Optional[Tuple[
     best_consensus_score = None
     best_inliers_mask = None
 
-    # Test exhaustif de toutes les paires possibles
+    # Exhaustive search over all possible pairs
     for i in range(len(pixel_pos)):
         for j in range(i + 1, len(pixel_pos)):
             delta_px = pixel_pos[j] - pixel_pos[i]
@@ -248,11 +251,11 @@ def fit_axis_ransac(points: List[dict], coord_key: str) -> Tuple[Optional[Tuple[
         return None, 0
 
     nb_inliers = int(best_inliers_mask.sum())
-    # Condition de sécurité : minimum 3 points alignés et espacement régulier
+    # Safety condition: minimum 3 aligned points with regular spacing
     if nb_inliers < 3 or (nb_inliers == 3 and not verify_regular_spacing(pixel_pos[best_inliers_mask], real_vals[best_inliers_mask])):
         return None, 0
 
-    # Régression finale par moindres carrés sur les points validés
+    # Final least-squares regression over validated inliers
     slope, intercept = np.polyfit(pixel_pos[best_inliers_mask], real_vals[best_inliers_mask], 1)
     px_min, px_max = pixel_pos[best_inliers_mask].min(), pixel_pos[best_inliers_mask].max()
     
@@ -260,7 +263,7 @@ def fit_axis_ransac(points: List[dict], coord_key: str) -> Tuple[Optional[Tuple[
 
 
 def calibrate_single_axis(numbers: List[dict], align_coord: str, tolerance: float):
-    """Sélectionne le meilleur alignement de graduations pour un axe donné."""
+    """Selects the best tick alignment for a given axis."""
     best_calibration, max_inliers, max_span = None, 0, 0.0
     tick_coord = "cx" if align_coord == "cy" else "cy"
 
@@ -277,8 +280,8 @@ def calibrate_single_axis(numbers: List[dict], align_coord: str, tolerance: floa
 
 def calibrate_axes(image: np.ndarray):
     """
-    Localise les graduations et calibre la relation pixels -> unités réelles.
-    Effectue une passe de secours sans binarisation en cas d'échec initial.
+    Locates tick marks and calibrates the mapping from pixels to physical units.
+    Executes a fallback pass with binarization if initial detection is partial.
     """
     h, w = image.shape[:2]
     align_tolerance = max(10, 0.02 * max(h, w))
@@ -289,13 +292,13 @@ def calibrate_axes(image: np.ndarray):
     x_scale, nb_x = calibrate_single_axis(numeric_items, "cy", align_tolerance)
     y_scale, nb_y = calibrate_single_axis(numeric_items, "cx", align_tolerance)
 
-    # Passe de secours avec binarisation si calibration incomplète
+    # Fallback pass with Otsu/threshold binarization if axis calibration is incomplete
     if nb_x < 3 or nb_y < 3:
-        print("  [OCR] Détection partielle des axes -> passe de secours avec binarisation...")
+        print("  [OCR] Partial axis detection -> fallback pass with binarization...")
         fallback_items = extract_text_boxes(image, binarize=True)
         for item in fallback_items:
             if item["value"] is not None:
-                # Ajoute l'élément s'il n'est pas déjà connu
+                # Add item if not already detected
                 if all(abs(item["cx"] - existing["cx"]) > 8 or abs(item["cy"] - existing["cy"]) > 8 for existing in numeric_items):
                     numeric_items.append(item)
                     ocr_items.append(item)
@@ -308,15 +311,15 @@ def calibrate_axes(image: np.ndarray):
         if nb_y_alt >= nb_y:
             y_scale, nb_y = y_alt, nb_y_alt
 
-    print(f"  [OCR] Graduations retenues : {sorted(item['value'] for item in numeric_items)}")
-    print(f"  [OCR] Points cohérents -> Axe X: {nb_x}, Axe Y: {nb_y}")
+    print(f"  [OCR] Retained tick marks: {sorted(item['value'] for item in numeric_items)}")
+    print(f"  [OCR] Consistent points -> X Axis: {nb_x}, Y Axis: {nb_y}")
     return x_scale, y_scale, ocr_items
 
 
 def find_legend_color_patch(patch_bgr: np.ndarray, patch_hsv: np.ndarray, text_height: int) -> Optional[np.ndarray]:
     """
-    Identifie une pastille ou un segment coloré représentatif de la légende.
-    Vérifie la compacité et le ratio d'aspect pour rejeter les lettres résiduelles.
+    Identifies a representative color patch or line segment for a legend item.
+    Verifies compactness and aspect ratio to discard residual text characters.
     """
     mask = ((patch_hsv[:, :, 1] > 50) | (patch_hsv[:, :, 2] < 160)).astype(np.uint8)
     nb_components, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -338,11 +341,11 @@ def find_legend_color_patch(patch_bgr: np.ndarray, patch_hsv: np.ndarray, text_h
         return None
 
     median_bgr = np.median(patch_bgr[labels == target_id], axis=0)
-    return median_bgr[::-1]  # Conversion BGR -> RGB
+    return median_bgr[::-1]  # Convert BGR -> RGB
 
 
 def extract_curve_legends(image: np.ndarray, text_boxes: List[dict]) -> List[dict]:
-    """Associe chaque libellé textuel à la pastille de couleur située immédiatement à sa gauche."""
+    """Associates each text label with the color patch located directly to its left."""
     h, _ = image.shape[:2]
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     detected_legends = []
@@ -363,13 +366,13 @@ def extract_curve_legends(image: np.ndarray, text_boxes: List[dict]) -> List[dic
         color_rgb = find_legend_color_patch(image[roi_y0:roi_y1, roi_x0:roi_x1], hsv[roi_y0:roi_y1, roi_x0:roi_x1], th)
         if color_rgb is not None:
             detected_legends.append({"text": label, "color_rgb": color_rgb})
-            print(f"  [Légende] '{label}' -> RGB {color_rgb.astype(int).tolist()}")
+            print(f"  [Legend] '{label}' -> RGB {color_rgb.astype(int).tolist()}")
 
     return detected_legends
 
 
 def match_curves_with_legends(curve_colors: List[np.ndarray], legends: List[dict]) -> Dict[int, str]:
-    """Appariement glouton entre les courbes extraites et les légendes par proximité de couleur."""
+    """Greedy bipartite matching between extracted curves and legends based on color proximity."""
     candidates = []
     for c_idx, color in enumerate(curve_colors):
         for l_idx, leg in enumerate(legends):
@@ -390,28 +393,28 @@ def match_curves_with_legends(curve_colors: List[np.ndarray], legends: List[dict
 
 def extract_dark_curves(image: np.ndarray, text_boxes: List[tuple], colored_mask: Optional[np.ndarray] = None, y_max_limit: Optional[int] = None) -> np.ndarray:
     """
-    Extrait les tracés noirs/sombres par filtrage morphologique soustractif.
-    Supprime le texte, la grille, les axes et les bordures anti-aliasées des courbes de couleur.
+    Extracts black/dark traces using subtractive morphological filtering.
+    Removes text, grid lines, axes, and anti-aliasing artifacts from colored curves.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
 
-    # 1. Masquage des zones de texte
+    # 1. Mask text regions
     for x0, y0, x1, y1 in text_boxes:
         cv2.rectangle(binary, (int(x0) - 5, int(y0) - 5), (int(x1) + 5, int(y1) + 5), 0, -1)
 
-    # 2. Élimination des lignes orthogonales droites (axes et grille)
+    # 2. Eliminate straight orthogonal lines (axes and grid)
     horiz_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1)))
     vert_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40)))
     grid_mask = cv2.dilate(cv2.add(horiz_lines, vert_lines), np.ones((3, 3), np.uint8), iterations=1)
     cleaned = cv2.subtract(binary, grid_mask)
 
-    # 3. Élimination des artefacts d'anti-aliasing des courbes colorées
+    # 3. Eliminate anti-aliasing artifacts from colored curves
     if colored_mask is not None:
         dilated_colors = cv2.dilate(colored_mask.astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=1)
         cleaned = cv2.subtract(cleaned, dilated_colors)
 
-    # 4. Conservation du tracé continu ET des marqueurs expérimentaux (connectés ou déconnectés)
+    # 4. Preserve continuous traces AND experimental markers (connected or disconnected)
     contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     result_canvas = np.zeros_like(cleaned)
     h_img, w_img = cleaned.shape[:2]
@@ -424,12 +427,12 @@ def extract_dark_curves(image: np.ndarray, text_boxes: List[tuple], colored_mask
         cx = m['m10'] / max(1e-5, m['m00'])
         cy = m['m01'] / max(1e-5, m['m00'])
 
-        # Ne retenir que les éléments situés dans la zone active du graphique (pas sur les bords d'axes)
+        # Only retain elements inside the active plotting area (outside axis borders)
         if 42 <= cx <= w_img - 15 and 30 <= cy <= max_y:
-            # Branche continue de modèle
+            # Continuous model curve segment
             if w > 20 or h > 20:
                 cv2.drawContours(result_canvas, [cnt], -1, 255, -1)
-            # Marqueur expérimental déconnecté (pastille/point isolé)
+            # Disconnected experimental marker (isolated dot / tick)
             elif 2 <= area <= 70 and w <= 16 and h <= 16:
                 cv2.drawContours(result_canvas, [cnt], -1, 255, -1)
 
@@ -438,9 +441,9 @@ def extract_dark_curves(image: np.ndarray, text_boxes: List[tuple], colored_mask
 
 def segment_image_curves(image: np.ndarray, text_boxes: List[tuple], forced_clusters: str = "AUTO", y_max_limit: Optional[int] = None) -> List[dict]:
     """
-    Sépare les différentes courbes présentes dans le graphique :
-    - Détection chromatique via MeanShift ou KMeans
-    - Détection achromatique via morphologie mathématique
+    Separates individual curves in the plot:
+    - Chromatic detection via MeanShift or KMeans
+    - Achromatic detection via mathematical morphology
     """
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -452,11 +455,11 @@ def segment_image_curves(image: np.ndarray, text_boxes: List[tuple], forced_clus
         pixel_rgb = rgb[color_mask]
 
         if str(forced_clusters).strip().upper() == "AUTO":
-            # Représentation circulaire de la teinte pour éviter la discontinuité à 180°
+            # Circular representation of hue to avoid discontinuity at 180 deg
             hue_angle = hsv[:, :, 0][color_mask] * (np.pi / 90.0)
             features = np.column_stack((np.cos(hue_angle) * 100, np.sin(hue_angle) * 100))
             
-            # Échantillonnage représentatif pour accélérer la convergence MeanShift
+            # Representative subsampling to speed up MeanShift convergence
             rng = np.random.default_rng(0)
             sample_indices = rng.choice(len(features), min(1000, len(features)), replace=False)
             
@@ -476,7 +479,7 @@ def segment_image_curves(image: np.ndarray, text_boxes: List[tuple], forced_clus
 
     dark_pixels = extract_dark_curves(image, text_boxes, color_mask, y_max_limit=y_max_limit)
     if len(dark_pixels) >= MIN_BLACK_PIXELS:
-        print(f"  -> Tracé noir/gris détecté ({len(dark_pixels)} pixels)")
+        print(f"  -> Black/gray trace detected ({len(dark_pixels)} pixels)")
         detected_curves.append({"coords": dark_pixels, "color": np.zeros(3)})
 
     return detected_curves
@@ -484,23 +487,23 @@ def segment_image_curves(image: np.ndarray, text_boxes: List[tuple], forced_clus
 
 def sample_curve_and_markers(coords: np.ndarray, img_shape: Tuple[int, int], image: Optional[np.ndarray] = None) -> Tuple[Optional[Tuple[np.ndarray, np.ndarray]], Optional[Tuple[np.ndarray, np.ndarray]]]:
     """
-    Analyse un tracé pour extraire de façon découplée :
-    1. Le profil de la courbe continue (modèle théorique / fitting).
-    2. Les coordonnées discrètes des marqueurs expérimentaux (ticks / dots).
+    Analyzes a trace to extract in a decoupled manner:
+    1. Continuous curve profile (theoretical model / fitting).
+    2. Discrete coordinates of experimental markers (ticks / dots).
     
-    Retourne (line_data, points_data) :
-    - line_data : (x_line, y_line) ou None si nuage de points pur
-    - points_data : (x_points, y_points) ou None si courbe continue pure sans marqueurs
+    Returns (line_data, points_data):
+    - line_data: (x_line, y_line) or None if pure scatter plot
+    - points_data: (x_points, y_points) or None if pure continuous line without markers
     """
     ys, xs = coords[:, 0], coords[:, 1]
     min_x, max_x = xs.min(), xs.max()
     span_x = max_x - min_x
 
-    # Masque binaire englobant
+    # Binary mask
     mask = np.zeros(img_shape[:2], dtype=np.uint8)
     mask[ys, xs] = 255
 
-    # 1. Vérification nuage de points pur (éléments isolés dès le départ)
+    # 1. Verification of pure scatter plot (isolated elements from the start)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     valid_comps = [i for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] >= 5]
 
@@ -518,7 +521,7 @@ def sample_curve_and_markers(coords: np.ndarray, img_shape: Tuple[int, int], ima
         pts = sorted([centroids[i] for i in filtered], key=lambda p: p[0])
         return None, (np.array([p[0] for p in pts], dtype=float), np.array([p[1] for p in pts], dtype=float))
 
-    # 2. Le tracé comporte une ligne continue : on sépare les branches continues des marqueurs déconnectés
+    # 2. Trace contains a continuous line: separate continuous branches from disconnected markers
     line_mask = np.zeros_like(mask)
     disconnected_markers = []
     marker_template_indices = []
@@ -537,8 +540,8 @@ def sample_curve_and_markers(coords: np.ndarray, img_shape: Tuple[int, int], ima
 
     on_line_markers = []
 
-    # 3. Détection des marqueurs le long du tracé
-    # Stratégie A : Template matching guidé si pastilles déconnectées géométriquement compactes
+    # 3. Detection of markers along the continuous trace
+    # Strategy A: Guided template matching if compact disconnected markers exist
     if image is not None and len(marker_template_indices) >= 2:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         tmpl_idx = marker_template_indices[1]
@@ -556,7 +559,7 @@ def sample_curve_and_markers(coords: np.ndarray, img_shape: Tuple[int, int], ima
             for x, y in zip(px + tw / 2.0, py + th / 2.0):
                 on_line_markers.append(np.array([x, y]))
 
-    # Stratégie B : Érosion morphologique adaptative
+    # Strategy B: Adaptive morphological erosion
     if not on_line_markers:
         dist = cv2.distanceTransform(line_mask, cv2.DIST_L2, 5)
         non_zero = dist[dist > 0]
@@ -579,7 +582,7 @@ def sample_curve_and_markers(coords: np.ndarray, img_shape: Tuple[int, int], ima
             if has_markers:
                 on_line_markers = [cents_e[i] for i in valid_e if stats_e[i, cv2.CC_STAT_WIDTH] <= 15]
 
-    # 4. Fusion des marqueurs expérimentaux
+    # 4. Merge detected experimental markers
     all_markers = disconnected_markers + on_line_markers
     cleaned_markers = []
     if len(all_markers) >= 4:
@@ -596,7 +599,7 @@ def sample_curve_and_markers(coords: np.ndarray, img_shape: Tuple[int, int], ima
         pts_y = np.array([p[1] for p in cleaned_markers], dtype=float)
         points_data = (pts_x, pts_y)
 
-    # 5. Extraction propre de la ligne continue (soustraction des marqueurs + lissage)
+    # 5. Clean extraction of continuous curve (subtracting markers + smoothing)
     line_canvas = line_mask.copy()
     if has_markers:
         for mx, my in cleaned_markers:
@@ -628,13 +631,13 @@ def sample_curve_and_markers(coords: np.ndarray, img_shape: Tuple[int, int], ima
 
 
 def project_to_axis_units(pixel_values: np.ndarray, scale_spec: Tuple[float, float, float, float]) -> np.ndarray:
-    """Applique la transformation affine pixels -> unités réelles calibrées."""
+    """Applies affine transformation from pixel coordinates to calibrated physical units."""
     p1, v1, p2, v2 = scale_spec
     return v1 + (pixel_values - p1) * (v2 - v1) / (p2 - p1)
 
 
 def generate_unique_curve_name(base_name: str, used_names: set) -> str:
-    """Génère un identifiant unique en évitant les collisions de légendes."""
+    """Generates a unique identifier avoiding legend naming collisions."""
     candidate, count = base_name, 2
     while candidate in used_names:
         candidate = f"{base_name}_{count}"
@@ -643,23 +646,23 @@ def generate_unique_curve_name(base_name: str, used_names: set) -> str:
 
 
 def export_verification_chart(original_img: np.ndarray, curves: List[dict], output_path: str, is_calibrated: bool):
-    """Génère un graphique comparatif côte à côte (image vs données extraites)."""
+    """Generates a side-by-side comparison figure (original image vs extracted data)."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     ax1.imshow(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB))
-    ax1.set_title("Image d'origine")
+    ax1.set_title("Original Image")
     ax1.axis("off")
 
     for curve in curves:
         color_hex = curve["hex"]
         name = curve["name"]
         
-        # 1. Tracé de la ligne continue (si présente)
+        # 1. Plot continuous line (if present)
         if "line_x" in curve:
-            label_line = f"{name} (Ligne)" if "points_x" in curve else name
+            label_line = f"{name} (Line)" if "points_x" in curve else name
             ax2.plot(curve["line_x"], curve["line_y"], label=label_line, color=color_hex, linewidth=2)
             
-        # 2. Tracé des points expérimentaux (si présents)
+        # 2. Plot experimental points (if present)
         if "points_x" in curve:
             label_pts = f"{name} (Points)" if "line_x" in curve else name
             is_dark = color_hex.lower() in ("#000000", "#0", "black")
@@ -667,7 +670,7 @@ def export_verification_chart(original_img: np.ndarray, curves: List[dict], outp
             ew = 1.0 if face == "white" else 0.6
             ax2.scatter(curve["points_x"], curve["points_y"], label=label_pts, facecolors=face, edgecolors='black', linewidths=ew, s=30, zorder=5)
 
-    status_title = "Données extraites" if is_calibrated else "Données extraites (en pixels - axes non calibrés)"
+    status_title = "Extracted Data" if is_calibrated else "Extracted Data (in pixels - uncalibrated axes)"
     ax2.set_title(status_title)
     ax2.grid(True, linestyle="--", alpha=0.6)
     ax2.legend()
@@ -683,14 +686,14 @@ def export_verification_chart(original_img: np.ndarray, curves: List[dict], outp
 
 
 def process_chart_image(image_path: str, output_directory: str) -> bool:
-    """Traite une image de graphique et génère le fichier Excel et le plot de contrôle."""
+    """Processes a chart image and generates the calibrated Excel spreadsheet and control plot."""
     start_time = time.perf_counter()
     file_name = os.path.basename(image_path)
-    print(f"\nTraitement : {file_name}")
+    print(f"\nProcessing: {file_name}")
 
     img = cv2.imread(image_path)
     if img is None:
-        print("  -> Erreur : impossible d'ouvrir le fichier image.")
+        print("  -> Error: unable to open image file.")
         return False
 
     height, width = img.shape[:2]
@@ -709,21 +712,21 @@ def process_chart_image(image_path: str, output_directory: str) -> bool:
 
     is_calibrated = len(fallback_axes) == 0
     if not is_calibrated:
-        print(f"  -> Axes non résolus ({'+'.join(fallback_axes)}) : bascule automatique en coordonnées pixels.")
+        print(f"  -> Unresolved axes ({'+'.join(fallback_axes)}): automatic fallback to pixel coordinates.")
 
-    print(f"  -> Calibration X : [{x_scale[1]:.3g} ; {x_scale[3]:.3g}] | Calibration Y : [{y_scale[1]:.3g} ; {y_scale[3]:.3g}]")
+    print(f"  -> X Calibration: [{x_scale[1]:.3g} ; {x_scale[3]:.3g}] | Y Calibration: [{y_scale[1]:.3g} ; {y_scale[3]:.3g}]")
 
     legends = extract_curve_legends(img, ocr_items)
     curves = segment_image_curves(img, [item["box"] for item in ocr_items], y_max_limit=y_max_limit)
 
     if not curves:
-        print("  -> Erreur : aucun signal de courbe détecté.")
+        print("  -> Error: no curve signal detected.")
         return False
 
     legend_map = match_curves_with_legends([c["color"] for c in curves], legends)
     registered_names = set()
 
-    # Détection du titre si courbe unique
+    # Detect title if single curve present
     chart_title = None
     if len(curves) == 1:
         text_only = [item for item in ocr_items if item["value"] is None and len(item["text"].strip()) > 3]
@@ -738,19 +741,19 @@ def process_chart_image(image_path: str, output_directory: str) -> bool:
         line_data, points_data = sample_curve_and_markers(curve["coords"], img.shape, img)
         curve["hex"] = "#{:02x}{:02x}{:02x}".format(*(int(c) for c in curve["color"]))
 
-        # 1. Légende officielle ou stratégie de repli
+        # 1. Official legend label or fallback strategy
         default_label = legend_map.get(idx)
         if default_label is None:
             if len(curves) == 1 and chart_title:
                 default_label = chart_title
             else:
                 color_name = get_closest_color_name(curve["color"])
-                default_label = f"Courbe_{color_name}"
+                default_label = f"Curve_{color_name}"
 
         curve["name"] = generate_unique_curve_name(default_label, registered_names)
         registered_names.add(curve["name"])
 
-        # 2. Calibration et stockage des coordonnées
+        # 2. Calibration and storage of coordinates
         has_line = line_data is not None
         has_points = points_data is not None
 
@@ -760,11 +763,11 @@ def process_chart_image(image_path: str, output_directory: str) -> bool:
             curve["points_x"] = project_to_axis_units(points_data[0], x_scale)
             curve["points_y"] = project_to_axis_units(points_data[1], y_scale)
             
-            data_columns[f"{curve['name']}_Ligne_X"] = curve["line_x"]
-            data_columns[f"{curve['name']}_Ligne_Y"] = curve["line_y"]
+            data_columns[f"{curve['name']}_Line_X"] = curve["line_x"]
+            data_columns[f"{curve['name']}_Line_Y"] = curve["line_y"]
             data_columns[f"{curve['name']}_Points_X"] = curve["points_x"]
             data_columns[f"{curve['name']}_Points_Y"] = curve["points_y"]
-            print(f"  -> {curve['name']} : Modèle ({len(curve['line_x'])} pts) + Mesures expérimentales ({len(curve['points_x'])} points)")
+            print(f"  -> {curve['name']} : Model ({len(curve['line_x'])} pts) + Experimental measurements ({len(curve['points_x'])} points)")
 
         elif has_points and not has_line:
             curve["points_x"] = project_to_axis_units(points_data[0], x_scale)
@@ -772,7 +775,7 @@ def process_chart_image(image_path: str, output_directory: str) -> bool:
             
             data_columns[f"{curve['name']}_X"] = curve["points_x"]
             data_columns[f"{curve['name']}_Y"] = curve["points_y"]
-            print(f"  -> {curve['name']} : Nuage de points expérimental ({len(curve['points_x'])} points)")
+            print(f"  -> {curve['name']} : Experimental scatter plot ({len(curve['points_x'])} points)")
 
         else:
             curve["line_x"] = project_to_axis_units(line_data[0], x_scale)
@@ -780,11 +783,11 @@ def process_chart_image(image_path: str, output_directory: str) -> bool:
             
             data_columns[f"{curve['name']}_X"] = curve["line_x"]
             data_columns[f"{curve['name']}_Y"] = curve["line_y"]
-            print(f"  -> {curve['name']} : Courbe continue ({len(curve['line_x'])} pts)")
+            print(f"  -> {curve['name']} : Continuous curve ({len(curve['line_x'])} pts)")
 
-    # Export tabulaire sous Excel
+    # Tabular export to Excel
     base_name = os.path.splitext(file_name)[0]
-    excel_path = os.path.join(output_directory, f"{base_name}_donnees.xlsx")
+    excel_path = os.path.join(output_directory, f"{base_name}_data.xlsx")
     plot_path = os.path.join(output_directory, f"{base_name}_verification.png")
 
     df = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in data_columns.items()]))
@@ -792,14 +795,14 @@ def process_chart_image(image_path: str, output_directory: str) -> bool:
     export_verification_chart(img, curves, plot_path, is_calibrated)
 
     elapsed = time.perf_counter() - start_time
-    print(f"  -> Succès : {len(curves)} courbe(s) traitée(s) en {elapsed:.1f}s")
+    print(f"  -> Success: {len(curves)} curve(s) processed in {elapsed:.1f}s")
     return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extraction automatique de courbes expérimentales.")
-    parser.add_argument("--input", default=DEFAULT_INPUT_DIR, help="Dossier contenant les images à traiter.")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR, help="Dossier de sauvegarde des résultats.")
+    parser = argparse.ArgumentParser(description="Automated extraction of experimental curves.")
+    parser.add_argument("--input", default=DEFAULT_INPUT_DIR, help="Directory containing images to process.")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR, help="Directory to save output results.")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -811,12 +814,12 @@ def main():
         files_to_process.extend(glob.glob(os.path.join(args.input, ext)))
 
     if not files_to_process:
-        print(f"Aucune image trouvée dans '{args.input}'.")
+        print(f"No image found in '{args.input}'.")
         return
 
     print("==========================================================")
-    print("EXTRACTION AUTOMATIQUE DE COURBES EXPÉRIMENTALES")
-    print(f"Images détectées : {len(files_to_process)}")
+    print("AUTOMATED EXPERIMENTAL CURVE EXTRACTION PIPELINE")
+    print(f"Images detected: {len(files_to_process)}")
     print("==========================================================")
 
     success_count = 0
@@ -825,9 +828,9 @@ def main():
             if process_chart_image(image_path, args.output):
                 success_count += 1
         except Exception as err:
-            print(f"  -> Échec sur {os.path.basename(image_path)} : {err}")
+            print(f"  -> Failed on {os.path.basename(image_path)}: {err}")
 
-    print(f"\nTraitement terminé : {success_count}/{len(files_to_process)} fichiers traités avec succès.")
+    print(f"\nProcessing complete: {success_count}/{len(files_to_process)} files processed successfully.")
 
 
 if __name__ == "__main__":
