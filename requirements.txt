@@ -1,0 +1,89 @@
+# ==============================================================================
+# PROJET TECHNIQUE (2A EMSE) - EXTRACTION AUTOMATIQUE DE COURBES EXPÉRIMENTALES
+# ==============================================================================
+# CAHIER DES CHARGES & EXIGENCES FONCTIONNELLES ET TECHNIQUES (REQUIREMENTS)
+# ==============================================================================
+#
+# 1. EXIGENCE DE TRAITEMENT 100% AUTOMATISÉ (ZÉRO INTERVENTION MANUELLE)
+#    - Le pipeline doit fonctionner de bout en bout sans aucune saisie manuelle.
+#    - Interdiction de hardcoder des coordonnées de repères, d'axes ou de plages.
+#    - Traitement par lot (batch processing) automatisé de toutes les figures
+#      présentes dans le dossier images/ vers le dossier data/.
+#
+# 2. EXIGENCE DE CALIBRATION DES AXES (OCR & RANSAC ROBUSTE)
+#    - Localisation automatique des étiquettes numériques sur les axes X et Y
+#      à l'aide du moteur EasyOCR.
+#    - Double passe d'OCR (binarisée Otsu + passe de secours en niveaux de gris)
+#      pour garantir la lecture des chiffres fins ou faiblement contrastés.
+#    - Validation des alignements et élimination des faux positifs par régression
+#      linéaire RANSAC avec vérification de la régularité du pas de graduation.
+#    - Conversion affine automatique : coordonnées pixels -> unités physiques réelles.
+#    - Bascule automatique sécurisée en repère pixels en cas d'axes non résolus.
+#
+# 3. EXIGENCE D'EXTRACTION ET D'APPARIEMENT DES LÉGENDES
+#    - Détection automatique des libellés textuels de légende dans la figure.
+#    - Détection de la pastille ou du segment coloré situé immédiatement à gauche.
+#    - Appariement glouton entre chaque pastille et chaque courbe par distance
+#      euclidienne minimale dans l'espace RGB (seuil d'acceptation <= 70).
+#    - Nommage automatique et univoque de chaque courbe selon la légende trouvée,
+#      ou stratégie de repli explicite (Courbe_<Couleur> ou Titre de la figure).
+#
+# 4. EXIGENCE DE SEGMENTATION MULTI-COURBES (CHROMATIQUE & ACHROMATIQUE)
+#    - Séparation des courbes colorées par clustering non supervisé MeanShift
+#      sur la teinte cyclique HSV (cosinus/sinus de l'angle de teinte).
+#    - Extraction des tracés noirs/gris par filtrage morphologique soustractif :
+#      élimination des axes, des traits de grille, des boîtes de texte et de
+#      l'anti-aliasing résiduel des courbes colorées.
+#    - Bornage dynamique en Y basé sur la graduation minimale calibrée pour
+#      exclure strictement les tirets et textes sous l'axe X (évitant les faux pics).
+#
+# 5. EXIGENCE DE DÉCOUPLAGE : MODÈLE THÉORIQUE vs MESURES EXPÉRIMENTALES
+#    - Identification autonome du type de tracé :
+#        a) Nuage de points expérimental pur (scatter plots).
+#        b) Courbe continue pure (modèle théorique seul).
+#        c) Courbe mixte : modèle théorique continu (Fitting) + points discrets (Exp data).
+#    - Pour les courbes mixtes (ex. test_graph) :
+#        * Détection exhaustive des marqueurs/pastilles :
+#          - Extraction de tous les points expérimentaux, y compris les points
+#            déconnectés du début de réaction (à Y = 0).
+#          - Template matching guidé par corrélation croisée normalisée (NCC) pour
+#            détecter l'ensemble de la chaîne de pastilles le long du tracé.
+#        * Découplage strict du tracé continu :
+#          - Soustraction locale de l'empreinte des pastilles pour ne pas déformer
+#            la ligne continue vers les marqueurs.
+#          - Lissage Savitzky-Golay adapté avec préservation stricte des bornes
+#            physiques (Y dans [0, 1]) et élimination des ondulations en dents de scie.
+#
+# 6. EXIGENCE DU FORMAT DE SORTIE EXCEL (X OBLIGATOIREMENT À CÔTÉ DE Y)
+#    - Fichier généré : data/<nom_image>_donnees.xlsx
+#    - Pour chaque courbe extraite, la colonne des abscisses X doit être
+#      immédiatement adjacente à la colonne des ordonnées Y :
+#        * Courbe mixte : <Nom>_Ligne_X, <Nom>_Ligne_Y, <Nom>_Points_X, <Nom>_Points_Y
+#        * Courbe simple : <Nom>_X, <Nom>_Y
+#    - Pas d'inversion, pas de colonnes orphelines, valeurs calibrées en unités réelles.
+#
+# 7. EXIGENCE DU GRAPHIQUE COMPARATIF DE CONTRÔLE (VÉRIFICATION VISUELLE)
+#    - Fichier généré : data/<nom_image>_verification.png
+#    - Affichage côte à côte :
+#        * Panneau gauche : Image d'origine du graphique scanné.
+#        * Panneau droit  : Données extraites superposées (ligne continue en trait
+#                           plein, points expérimentaux en disques distincts ouverts
+#                           ou colorés, respectant les couleurs réelles).
+#
+# 8. EXIGENCE DE ROBUSTESSE ET COMPATIBILITÉ WINDOWS / ONEDRIVE
+#    - Tolérance aux verrous de synchronisation de fichiers OneDrive sur Windows
+#      via un mécanisme de retry automatique à l'écriture.
+#    - Code Python 3 propre, documenté et modulaire.
+#
+# ==============================================================================
+# DÉPENDANCES ET BIBLIOTHÈQUES LOGICIELLES REQUISES (PIP PACKAGES)
+# ==============================================================================
+
+opencv-python>=4.8.0      # Traitement d'images, morphologie mathématique, template matching
+numpy>=1.24.0             # Calcul matriciel, algèbre linéaire, régressions polynomiales
+pandas>=2.0.0             # Structuration des séries de données et création des DataFrames
+openpyxl>=3.1.0           # Moteur d'exportation des feuilles de calcul Microsoft Excel (.xlsx)
+scikit-learn>=1.3.0       # Algorithmes de partitionnement / clustering (MeanShift, KMeans)
+scipy>=1.11.0             # Traitement du signal, lissage Savitzky-Golay, filtres de maximum local
+matplotlib>=3.7.0         # Rendu headless des figures comparatives de vérification (.png)
+easyocr>=1.7.0            # Reconnaissance optique de caractères pour la lecture des graduations
