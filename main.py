@@ -1,6 +1,6 @@
 """
 Technical Project - Automated Curve Extraction from Scanned Scientific Plots
-Authors: 2A EMSE Project
+Authors: Haitam Safouane Ourtane, student at EMSE
 
 Processing Pipeline:
 1. OCR detection and robust axis calibration (linear RANSAC).
